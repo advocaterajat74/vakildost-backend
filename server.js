@@ -1,12 +1,8 @@
-// ==============================
-// Vakil Dost AI - Backend Server
-// ==============================
-
 require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-const OpenAI = require("openai");
+const fetch = require("node-fetch"); // if using Node < 18
 
 const app = express();
 
@@ -14,19 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ OpenAI Setup
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// ✅ Health Check Route
+// ✅ Test route
 app.get("/", (req, res) => {
-  res.send("Vakil Dost AI Backend is Running ✅");
+  res.send("Server is running 🚀");
 });
 
-// ==============================
-// ✅ MAIN API ROUTE
-// ==============================
+// ✅ Main API route
 app.post("/api/search", async (req, res) => {
   try {
     const { query, language } = req.body;
@@ -35,102 +24,55 @@ app.post("/api/search", async (req, res) => {
       return res.status(400).json({ error: "Query is required" });
     }
 
-    // Example response (replace later with OpenAI)
-    const responseText = `You asked: "${query}" in ${language}`;
-
-    res.json({
-      success: true,
-      answer: responseText
-    });
-
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: "Server error" });
-  }
-});
-app.post("/api/search", async (req, res) => {
-  try {
-    const {
-      name,
-      location,
-      caseType,
-      amount,
-      facts,
-      language,
-    } = req.body;
-
-    // 🔥 Lawyer-Level Prompt
+    // 🎯 Prompt for lawyer-style AI
     const prompt = `
-You are a senior Indian lawyer (BCI compliant).
+You are a professional lawyer AI.
 
-Rules:
-- Give practical and realistic legal advice
-- Use simple and clear language
-- Mention relevant laws (e.g., NI Act 138, CPC, IT Act, Income Tax Act)
-- Do NOT guarantee results
-- Be professional and trustworthy
-- If facts are unclear, ask 2 follow-up questions
+Give a clear, helpful legal answer.
 
-Respond in ${language || "English"}.
-If Hindi, use simple Hindi but keep legal terms in English.
+User Question: ${query}
 
--------------------------
-Case Details:
-Name: ${name || "Not provided"}
-Location: ${location || "India"}
-Case Type: ${caseType || "General"}
-Amount: ${amount || "N/A"}
-Facts: ${facts || "Not provided"}
--------------------------
+Respond in ${language || "English"} language.
+Explain in simple terms.
+    `;
 
-Give answer in this format:
-
-1. Legal Position  
-2. Applicable Law  
-3. What You Should Do Next  
-4. Time Limits (if any)  
-5. Draft Suggestion (if relevant)
-`;
-
-    // ✅ OpenAI API Call
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a highly experienced Indian advocate helping users understand legal issues clearly.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.5,
+    // ✅ OpenAI API call
+    const response = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "gpt-4.1-mini",
+        input: prompt
+      })
     });
 
-    // ✅ Send Response
+    const data = await response.json();
+
+    // ✅ Extract response text
+    const answer =
+      data.output?.[0]?.content?.[0]?.text ||
+      "No response from AI";
+
     res.json({
       success: true,
-      reply: response.choices[0].message.content,
+      answer
     });
 
   } catch (error) {
-    console.error("ERROR:", error);
+    console.error("Error:", error);
 
     res.status(500).json({
-      success: false,
-      message: "Server error. Please try again.",
+      error: "Something went wrong"
     });
   }
 });
 
-// ==============================
-// ✅ START SERVER
-// ==============================
-
+// ✅ Start server
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT} 🚀`);
+  console.log(`Server running on port ${PORT}`);
 });
