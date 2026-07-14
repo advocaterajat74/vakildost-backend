@@ -27,7 +27,27 @@ app.get("/", (req, res) => {
 // ==============================
 // ✅ MAIN API ROUTE
 // ==============================
+app.post("/api/search", async (req, res) => {
+  try {
+    const { query, language } = req.body;
 
+    if (!query) {
+      return res.status(400).json({ error: "Query is required" });
+    }
+
+    // Example response (replace later with OpenAI)
+    const responseText = `You asked: "${query}" in ${language}`;
+
+    res.json({
+      success: true,
+      answer: responseText
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Server error" });
+  }
+});
 app.post("/api/search", async (req, res) => {
   try {
     const {
