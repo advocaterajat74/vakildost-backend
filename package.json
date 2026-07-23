@@ -1,6 +1,6 @@
 {
   "name": "vakildost-backend",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "description": "Vakil Dost AI backend",
   "main": "server.js",
@@ -14,6 +14,7 @@
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.4.1"
   }
 }
