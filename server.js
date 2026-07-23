@@ -2,7 +2,7 @@ require("dotenv").config();
 
 const express = require("express");
 const cors = require("cors");
-
+const rateLimit = require("express-rate-limit");
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1);
@@ -32,7 +32,18 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
+// AI endpoint rate limiter
+const aiLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
 
+  message: {
+    success: false,
+    error: "Too many AI requests. Please try again after some time."
+  }
+});
 app.use((req, res, next) => {
   res.setHeader("X-VakilDost-Version", VERSION);
   console.log(
@@ -102,7 +113,7 @@ function extractOutputText(data) {
     .trim();
 }
 
-app.post("/api/search", async (req, res) => {
+app.post("/api/search", aiLimiter, async (req, res) => {
   const requestStartedAt = Date.now();
 
   try {
