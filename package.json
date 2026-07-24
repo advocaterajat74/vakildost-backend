@@ -1,15 +1,15 @@
 {
   "name": "vakildost-backend",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "private": true,
-  "description": "Vakil Dost AI backend",
+  "description": "Production backend for VakilDost AI legal-information assistant",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22 <25"
   },
   "dependencies": {
     "cors": "^2.8.5",
