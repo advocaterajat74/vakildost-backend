@@ -1,6 +1,4 @@
-VakilDost Backend V6
 
-server.js
 
     require("dotenv").config();
 
