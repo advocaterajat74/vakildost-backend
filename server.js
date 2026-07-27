@@ -10,8 +10,23 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT) || 10000;
-const VERSION = "2026-07-26-all-phases-v1";
+const VERSION = "2026-07-27-supabase-quota-v1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "")
+  .trim()
+  .replace(/\/$/, "");
+
+const SUPABASE_SECRET_KEY = String(
+  process.env.SUPABASE_SECRET_KEY || ""
+).trim();
+
+const DAILY_AI_LIMIT = Math.max(
+  1,
+  Number.parseInt(process.env.DAILY_AI_LIMIT || "5", 10) || 5
+);
+
+const SUPABASE_TIMEOUT_MS = 12000;
 const OPENAI_TIMEOUT_MS = 60000;
 const MAX_FACTS_LENGTH = 5000;
 
@@ -30,7 +45,7 @@ app.use(
       return callback(new Error("Origin not allowed"));
     },
     methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Accept"]
+    allowedHeaders: ["Content-Type", "Accept", "Authorization"]
   })
 );
 
@@ -944,6 +959,205 @@ Before answering, silently verify:
 `;
 }
 
+
+function getBearerToken(req) {
+  const authorization = String(
+    req.headers.authorization || ""
+  ).trim();
+
+  if (!authorization.toLowerCase().startsWith("bearer ")) {
+    return "";
+  }
+
+  return authorization.slice(7).trim();
+}
+
+async function fetchJsonWithTimeout(
+  url,
+  options = {},
+  timeoutMs = SUPABASE_TIMEOUT_MS
+) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+
+    const responseText = await response.text();
+
+    let data = null;
+
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText);
+      } catch (error) {
+        data = {
+          raw: responseText
+        };
+      }
+    }
+
+    return {
+      response,
+      data
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function ensureSupabaseConfigured() {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    const error = new Error(
+      "Supabase backend configuration is missing."
+    );
+
+    error.code = "SUPABASE_NOT_CONFIGURED";
+    throw error;
+  }
+}
+
+async function verifySupabaseUser(accessToken) {
+  ensureSupabaseConfigured();
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/auth/v1/user`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+
+  if (response.status === 401 || response.status === 403) {
+    return null;
+  }
+
+  if (!response.ok) {
+    console.error(
+      "Supabase user verification error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "Supabase could not verify the signed-in user."
+    );
+
+    error.code = "SUPABASE_AUTH_ERROR";
+    throw error;
+  }
+
+  if (!data || !data.id) {
+    return null;
+  }
+
+  return data;
+}
+
+async function consumeAIQuota(userId) {
+  ensureSupabaseConfigured();
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/rpc/consume_ai_quota`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        apikey: SUPABASE_SECRET_KEY
+      },
+      body: JSON.stringify({
+        p_user_id: userId,
+        p_daily_limit: DAILY_AI_LIMIT
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase quota consumption error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The daily AI quota could not be checked."
+    );
+
+    error.code = "SUPABASE_QUOTA_ERROR";
+    throw error;
+  }
+
+  const quota = Array.isArray(data) ? data[0] : data;
+
+  if (
+    !quota ||
+    typeof quota.allowed !== "boolean" ||
+    typeof quota.used !== "number" ||
+    typeof quota.remaining !== "number"
+  ) {
+    console.error(
+      "Unexpected Supabase quota response:",
+      data
+    );
+
+    const error = new Error(
+      "The quota service returned an invalid response."
+    );
+
+    error.code = "SUPABASE_QUOTA_INVALID";
+    throw error;
+  }
+
+  return quota;
+}
+
+async function refundAIQuota(userId) {
+  if (!userId || !SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    return;
+  }
+
+  try {
+    const { response, data } = await fetchJsonWithTimeout(
+      `${SUPABASE_URL}/rest/v1/rpc/refund_ai_quota`,
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          apikey: SUPABASE_SECRET_KEY
+        },
+        body: JSON.stringify({
+          p_user_id: userId
+        })
+      }
+    );
+
+    if (!response.ok) {
+      console.error(
+        "Supabase quota refund error:",
+        response.status,
+        data
+      );
+    }
+  } catch (error) {
+    console.error(
+      "Supabase quota refund request failed:",
+      error
+    );
+  }
+}
+
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
@@ -962,11 +1176,19 @@ app.get("/", (req, res) => {
 
 app.get("/health", (req, res) => {
   const apiKeyConfigured = Boolean(process.env.OPENAI_API_KEY);
+  const supabaseConfigured = Boolean(
+    SUPABASE_URL && SUPABASE_SECRET_KEY
+  );
 
-  res.status(apiKeyConfigured ? 200 : 503).json({
-    success: apiKeyConfigured,
-    status: apiKeyConfigured ? "ready" : "missing_api_key",
+  const ready =
+    apiKeyConfigured && supabaseConfigured;
+
+  res.status(ready ? 200 : 503).json({
+    success: ready,
+    status: ready ? "ready" : "configuration_missing",
     apiKeyConfigured,
+    supabaseConfigured,
+    dailyAiLimit: DAILY_AI_LIMIT,
     model: OPENAI_MODEL,
     version: VERSION
   });
@@ -981,6 +1203,20 @@ app.get("/api/search", (req, res) => {
 });
 
 app.post("/api/search", aiLimiter, async (req, res) => {
+  let authenticatedUser = null;
+  let quotaReservation = null;
+
+  async function releaseQuotaReservation() {
+    if (
+      quotaReservation &&
+      authenticatedUser &&
+      authenticatedUser.id
+    ) {
+      await refundAIQuota(authenticatedUser.id);
+      quotaReservation = null;
+    }
+  }
+
   try {
     const body = req.body || {};
 
@@ -1020,6 +1256,60 @@ app.post("/api/search", aiLimiter, async (req, res) => {
         success: false,
         error:
           "OPENAI_API_KEY is missing. Add it in Render Environment settings.",
+        version: VERSION
+      });
+    }
+
+    if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+      return res.status(503).json({
+        success: false,
+        error:
+          "Supabase backend configuration is missing.",
+        code: "SUPABASE_NOT_CONFIGURED",
+        version: VERSION
+      });
+    }
+
+    const accessToken = getBearerToken(req);
+
+    if (!accessToken) {
+      return res.status(401).json({
+        success: false,
+        error:
+          "Please sign in with Google before using Vakil Dost AI.",
+        code: "AUTH_REQUIRED",
+        version: VERSION
+      });
+    }
+
+    authenticatedUser =
+      await verifySupabaseUser(accessToken);
+
+    if (!authenticatedUser) {
+      return res.status(401).json({
+        success: false,
+        error:
+          "Your login session is invalid or has expired. Please sign in again.",
+        code: "INVALID_SESSION",
+        version: VERSION
+      });
+    }
+
+    quotaReservation =
+      await consumeAIQuota(authenticatedUser.id);
+
+    if (!quotaReservation.allowed) {
+      return res.status(429).json({
+        success: false,
+        error:
+          `You have used all ${DAILY_AI_LIMIT} free AI questions for today. Your quota resets at midnight India time.`,
+        code: "DAILY_QUOTA_REACHED",
+        quota: {
+          limit: DAILY_AI_LIMIT,
+          used: quotaReservation.used,
+          remaining: 0,
+          date: quotaReservation.quota_date || null
+        },
         version: VERSION
       });
     }
@@ -1133,6 +1423,8 @@ HANDLING INSTRUCTIONS:
         responseText
       );
 
+      await releaseQuotaReservation();
+
       return res.status(502).json({
         success: false,
         error:
@@ -1167,6 +1459,8 @@ HANDLING INSTRUCTIONS:
           "The AI service is temporarily unavailable. Please try again.";
       }
 
+      await releaseQuotaReservation();
+
       return res.status(openAIResponse.status).json({
         success: false,
         error: safeError,
@@ -1177,6 +1471,8 @@ HANDLING INSTRUCTIONS:
     const answer = extractAnswer(data);
 
     if (!answer) {
+      await releaseQuotaReservation();
+
       return res.status(502).json({
         success: false,
         error:
@@ -1199,17 +1495,44 @@ HANDLING INSTRUCTIONS:
         detection.source,
       detectionConfidence:
         detection.confidence,
+      quota: {
+        limit: DAILY_AI_LIMIT,
+        used: quotaReservation.used,
+        remaining: quotaReservation.remaining,
+        date: quotaReservation.quota_date || null
+      },
+      user: {
+        id: authenticatedUser.id,
+        email: authenticatedUser.email || null
+      },
       model: OPENAI_MODEL,
       version: VERSION
     });
   } catch (error) {
     console.error("Server error:", error);
 
+    await releaseQuotaReservation();
+
     if (error.name === "AbortError") {
       return res.status(504).json({
         success: false,
         error:
           "The AI request timed out. Please submit it again.",
+        version: VERSION
+      });
+    }
+
+    if (
+      error.code === "SUPABASE_NOT_CONFIGURED" ||
+      error.code === "SUPABASE_AUTH_ERROR" ||
+      error.code === "SUPABASE_QUOTA_ERROR" ||
+      error.code === "SUPABASE_QUOTA_INVALID"
+    ) {
+      return res.status(503).json({
+        success: false,
+        error:
+          "The secure login or quota service is temporarily unavailable. Please try again.",
+        code: error.code,
         version: VERSION
       });
     }
