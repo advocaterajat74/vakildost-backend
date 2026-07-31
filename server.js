@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 
 const app = express();
 
@@ -10,7 +11,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT) || 10000;
-const VERSION = "2026-07-29-intelligence-router-v1";
+const VERSION = "2026-07-29-draft-pass-payments-v1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const OPENAI_ROUTER_MODEL =
   process.env.OPENAI_ROUTER_MODEL || OPENAI_MODEL;
@@ -32,6 +33,28 @@ const DAILY_AI_LIMIT = Math.max(
 const SUPABASE_TIMEOUT_MS = 12000;
 const OPENAI_TIMEOUT_MS = 60000;
 const MAX_FACTS_LENGTH = 5000;
+
+const RAZORPAY_KEY_ID = String(
+  process.env.RAZORPAY_KEY_ID || ""
+).trim();
+
+const RAZORPAY_KEY_SECRET = String(
+  process.env.RAZORPAY_KEY_SECRET || ""
+).trim();
+
+const DRAFT_PASS_AMOUNT_PAISE = Math.max(
+  0,
+  Number.parseInt(
+    process.env.DRAFT_PASS_AMOUNT_PAISE || "0",
+    10
+  ) || 0
+);
+
+const DRAFT_PASS_CURRENCY = "INR";
+const DRAFT_PASS_PRODUCT_NAME =
+  "VakilDost AI-Generated Draft Pass";
+const RAZORPAY_API_BASE = "https://api.razorpay.com/v1";
+const RAZORPAY_TIMEOUT_MS = 15000;
 
 const allowedOrigins = [
   "https://vakildost.in",
@@ -62,6 +85,21 @@ const aiLimiter = rateLimit({
   message: {
     success: false,
     error: "Too many requests. Please wait and try again.",
+    version: VERSION
+  }
+});
+
+
+const paymentLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error:
+      "Too many payment requests. Please wait and try again.",
+    code: "PAYMENT_RATE_LIMIT",
     version: VERSION
   }
 });
@@ -1583,6 +1621,463 @@ async function refundAIQuota(userId) {
   }
 }
 
+
+function ensureRazorpayConfigured() {
+  if (
+    !RAZORPAY_KEY_ID ||
+    !RAZORPAY_KEY_SECRET ||
+    DRAFT_PASS_AMOUNT_PAISE < 1
+  ) {
+    const error = new Error(
+      "Draft Pass payment configuration is incomplete."
+    );
+
+    error.code = "RAZORPAY_NOT_CONFIGURED";
+    throw error;
+  }
+}
+
+function getRazorpayAuthorizationHeader() {
+  const credentials = Buffer.from(
+    `${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`,
+    "utf8"
+  ).toString("base64");
+
+  return `Basic ${credentials}`;
+}
+
+async function razorpayRequest(
+  path,
+  options = {},
+  timeoutMs = RAZORPAY_TIMEOUT_MS
+) {
+  ensureRazorpayConfigured();
+
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const response = await fetch(
+      `${RAZORPAY_API_BASE}${path}`,
+      {
+        ...options,
+        headers: {
+          Accept: "application/json",
+          Authorization:
+            getRazorpayAuthorizationHeader(),
+          ...(options.body
+            ? { "Content-Type": "application/json" }
+            : {}),
+          ...(options.headers || {})
+        },
+        signal: controller.signal
+      }
+    );
+
+    const responseText = await response.text();
+
+    let data = null;
+
+    if (responseText) {
+      try {
+        data = JSON.parse(responseText);
+      } catch (error) {
+        data = {
+          raw: responseText
+        };
+      }
+    }
+
+    if (!response.ok) {
+      console.error(
+        "Razorpay API error:",
+        response.status,
+        data
+      );
+
+      const error = new Error(
+        data?.error?.description ||
+        "Razorpay could not process the payment request."
+      );
+
+      error.code = "RAZORPAY_API_ERROR";
+      error.status = response.status;
+      throw error;
+    }
+
+    return data;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function insertDraftPassOrder({
+  id,
+  userId,
+  amountPaise
+}) {
+  ensureSupabaseConfigured();
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/draft_pass_orders`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        apikey: SUPABASE_SECRET_KEY,
+        Prefer: "return=representation"
+      },
+      body: JSON.stringify({
+        id,
+        user_id: userId,
+        provider: "razorpay",
+        amount_paise: amountPaise,
+        currency: DRAFT_PASS_CURRENCY,
+        status: "pending"
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase Draft Pass order insert error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Draft Pass order could not be created."
+    );
+
+    error.code = "DRAFT_PASS_ORDER_INSERT_FAILED";
+    throw error;
+  }
+
+  const order = Array.isArray(data) ? data[0] : data;
+
+  if (!order || !order.id) {
+    const error = new Error(
+      "The Draft Pass order service returned an invalid response."
+    );
+
+    error.code = "DRAFT_PASS_ORDER_INVALID";
+    throw error;
+  }
+
+  return order;
+}
+
+async function updateDraftPassOrder(
+  orderId,
+  values
+) {
+  ensureSupabaseConfigured();
+
+  const query = new URLSearchParams({
+    id: `eq.${orderId}`,
+    select:
+      "id,user_id,provider_order_id,provider_payment_id,amount_paise,currency,status,created_at,paid_at"
+  });
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/draft_pass_orders?${query.toString()}`,
+    {
+      method: "PATCH",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        apikey: SUPABASE_SECRET_KEY,
+        Prefer: "return=representation"
+      },
+      body: JSON.stringify({
+        ...values,
+        updated_at: new Date().toISOString()
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase Draft Pass order update error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Draft Pass order could not be updated."
+    );
+
+    error.code = "DRAFT_PASS_ORDER_UPDATE_FAILED";
+    throw error;
+  }
+
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function findDraftPassOrder({
+  userId,
+  providerOrderId
+}) {
+  ensureSupabaseConfigured();
+
+  const query = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    provider_order_id: `eq.${providerOrderId}`,
+    select:
+      "id,user_id,provider_order_id,provider_payment_id,amount_paise,currency,status,created_at,paid_at",
+    limit: "1"
+  });
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/draft_pass_orders?${query.toString()}`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        apikey: SUPABASE_SECRET_KEY
+      }
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase Draft Pass order lookup error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Draft Pass order could not be verified."
+    );
+
+    error.code = "DRAFT_PASS_ORDER_LOOKUP_FAILED";
+    throw error;
+  }
+
+  return Array.isArray(data) && data.length > 0
+    ? data[0]
+    : null;
+}
+
+async function finalizeDraftPassPayment({
+  orderId,
+  userId,
+  providerOrderId,
+  providerPaymentId
+}) {
+  ensureSupabaseConfigured();
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/rpc/finalize_draft_pass_payment`,
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        apikey: SUPABASE_SECRET_KEY
+      },
+      body: JSON.stringify({
+        p_order_id: orderId,
+        p_user_id: userId,
+        p_provider_order_id: providerOrderId,
+        p_provider_payment_id: providerPaymentId
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase Draft Pass finalization error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The verified payment could not be converted into a Draft Pass."
+    );
+
+    error.code = "DRAFT_PASS_FINALIZATION_FAILED";
+    throw error;
+  }
+
+  const result = Array.isArray(data) ? data[0] : data;
+
+  if (!result || typeof result.success !== "boolean") {
+    const error = new Error(
+      "The Draft Pass finalization service returned an invalid response."
+    );
+
+    error.code = "DRAFT_PASS_FINALIZATION_INVALID";
+    throw error;
+  }
+
+  return result;
+}
+
+async function getDraftPassBalance(userId) {
+  ensureSupabaseConfigured();
+
+  const query = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    select:
+      "id,passes_total,passes_used,expires_at,created_at",
+    order: "created_at.asc"
+  });
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/draft_pass_entitlements?${query.toString()}`,
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        apikey: SUPABASE_SECRET_KEY
+      }
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase Draft Pass balance error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Draft Pass balance could not be loaded."
+    );
+
+    error.code = "DRAFT_PASS_BALANCE_FAILED";
+    throw error;
+  }
+
+  const now = Date.now();
+  const entitlements = Array.isArray(data) ? data : [];
+
+  const active = entitlements.filter((item) => {
+    if (!item.expires_at) {
+      return true;
+    }
+
+    const expiry = Date.parse(item.expires_at);
+
+    return Number.isFinite(expiry) && expiry > now;
+  });
+
+  const total = active.reduce(
+    (sum, item) =>
+      sum + Math.max(0, Number(item.passes_total) || 0),
+    0
+  );
+
+  const used = active.reduce(
+    (sum, item) =>
+      sum + Math.max(0, Number(item.passes_used) || 0),
+    0
+  );
+
+  return {
+    total,
+    used,
+    remaining: Math.max(0, total - used)
+  };
+}
+
+function verifyRazorpayPaymentSignature({
+  providerOrderId,
+  providerPaymentId,
+  signature
+}) {
+  const expectedSignature = crypto
+    .createHmac("sha256", RAZORPAY_KEY_SECRET)
+    .update(
+      `${providerOrderId}|${providerPaymentId}`,
+      "utf8"
+    )
+    .digest("hex");
+
+  const expectedBuffer = Buffer.from(
+    expectedSignature,
+    "utf8"
+  );
+
+  const suppliedBuffer = Buffer.from(
+    String(signature || ""),
+    "utf8"
+  );
+
+  if (expectedBuffer.length !== suppliedBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(
+    expectedBuffer,
+    suppliedBuffer
+  );
+}
+
+async function authenticateRequestUser(req) {
+  const accessToken = getBearerToken(req);
+
+  if (!accessToken) {
+    const error = new Error(
+      "Please sign in with Google before continuing."
+    );
+
+    error.code = "AUTH_REQUIRED";
+    error.status = 401;
+    throw error;
+  }
+
+  const user = await verifySupabaseUser(accessToken);
+
+  if (!user) {
+    const error = new Error(
+      "Your login session is invalid or has expired. Please sign in again."
+    );
+
+    error.code = "INVALID_SESSION";
+    error.status = 401;
+    throw error;
+  }
+
+  return user;
+}
+
+function sendPaymentRouteError(res, error) {
+  console.error("Draft Pass payment error:", error);
+
+  const status =
+    Number(error?.status) ||
+    (error?.name === "AbortError" ? 504 : 500);
+
+  let message =
+    error?.message ||
+    "The Draft Pass payment request could not be completed.";
+
+  if (error?.code === "RAZORPAY_NOT_CONFIGURED") {
+    message =
+      "Draft Pass payments are not configured yet.";
+  } else if (error?.name === "AbortError") {
+    message =
+      "The payment service took too long to respond. Please try again.";
+  }
+
+  return res.status(status).json({
+    success: false,
+    error: message,
+    code:
+      error?.code ||
+      (error?.name === "AbortError"
+        ? "PAYMENT_TIMEOUT"
+        : "PAYMENT_ERROR"),
+    version: VERSION
+  });
+}
+
 app.get("/", (req, res) => {
   res.status(200).json({
     success: true,
@@ -1594,7 +2089,8 @@ app.get("/", (req, res) => {
       "Focused follow-up questions",
       "Verified resource linking",
       "Mobile-friendly formatting",
-      "Intelligence routing before quota"
+      "Intelligence routing before quota",
+      "Verified one-time Draft Pass payments"
     ],
     version: VERSION
   });
@@ -1606,6 +2102,12 @@ app.get("/health", (req, res) => {
     SUPABASE_URL && SUPABASE_SECRET_KEY
   );
 
+  const razorpayConfigured = Boolean(
+    RAZORPAY_KEY_ID &&
+    RAZORPAY_KEY_SECRET &&
+    DRAFT_PASS_AMOUNT_PAISE > 0
+  );
+
   const ready =
     apiKeyConfigured && supabaseConfigured;
 
@@ -1614,6 +2116,10 @@ app.get("/health", (req, res) => {
     status: ready ? "ready" : "configuration_missing",
     apiKeyConfigured,
     supabaseConfigured,
+    razorpayConfigured,
+    draftPassPayments: true,
+    draftPassAmountPaise: DRAFT_PASS_AMOUNT_PAISE,
+    draftPassCurrency: DRAFT_PASS_CURRENCY,
     dailyAiLimit: DAILY_AI_LIMIT,
     model: OPENAI_MODEL,
     routerModel: OPENAI_ROUTER_MODEL,
@@ -1621,6 +2127,294 @@ app.get("/health", (req, res) => {
     version: VERSION
   });
 });
+
+
+app.get(
+  "/api/draft-pass/status",
+  paymentLimiter,
+  async (req, res) => {
+    try {
+      const user = await authenticateRequestUser(req);
+      const balance = await getDraftPassBalance(user.id);
+
+      return res.status(200).json({
+        success: true,
+        draftPass: balance,
+        user: {
+          id: user.id,
+          email: user.email || null
+        },
+        version: VERSION
+      });
+    } catch (error) {
+      return sendPaymentRouteError(res, error);
+    }
+  }
+);
+
+app.post(
+  "/api/draft-pass/create-order",
+  paymentLimiter,
+  async (req, res) => {
+    let internalOrderId = null;
+
+    try {
+      ensureRazorpayConfigured();
+
+      const user = await authenticateRequestUser(req);
+
+      internalOrderId = crypto.randomUUID();
+
+      await insertDraftPassOrder({
+        id: internalOrderId,
+        userId: user.id,
+        amountPaise: DRAFT_PASS_AMOUNT_PAISE
+      });
+
+      const receipt =
+        `vd_${internalOrderId.replace(/-/g, "").slice(0, 24)}`;
+
+      let razorpayOrder;
+
+      try {
+        razorpayOrder = await razorpayRequest(
+          "/orders",
+          {
+            method: "POST",
+            body: JSON.stringify({
+              amount: DRAFT_PASS_AMOUNT_PAISE,
+              currency: DRAFT_PASS_CURRENCY,
+              receipt,
+              notes: {
+                product: "vakildost_draft_pass",
+                internal_order_id: internalOrderId
+              }
+            })
+          }
+        );
+      } catch (error) {
+        await updateDraftPassOrder(
+          internalOrderId,
+          {
+            status: "failed"
+          }
+        ).catch((updateError) => {
+          console.error(
+            "Could not mark failed Draft Pass order:",
+            updateError
+          );
+        });
+
+        throw error;
+      }
+
+      if (
+        !razorpayOrder ||
+        !razorpayOrder.id ||
+        razorpayOrder.amount !== DRAFT_PASS_AMOUNT_PAISE ||
+        razorpayOrder.currency !== DRAFT_PASS_CURRENCY
+      ) {
+        await updateDraftPassOrder(
+          internalOrderId,
+          {
+            status: "failed"
+          }
+        ).catch(() => {});
+
+        const error = new Error(
+          "Razorpay returned an invalid order."
+        );
+
+        error.code = "RAZORPAY_ORDER_INVALID";
+        throw error;
+      }
+
+      await updateDraftPassOrder(
+        internalOrderId,
+        {
+          provider_order_id: razorpayOrder.id,
+          status: "pending"
+        }
+      );
+
+      return res.status(201).json({
+        success: true,
+        checkout: {
+          keyId: RAZORPAY_KEY_ID,
+          orderId: razorpayOrder.id,
+          amount: DRAFT_PASS_AMOUNT_PAISE,
+          currency: DRAFT_PASS_CURRENCY,
+          name: "VakilDost",
+          description: DRAFT_PASS_PRODUCT_NAME,
+          internalOrderId,
+          prefill: {
+            email: user.email || ""
+          }
+        },
+        version: VERSION
+      });
+    } catch (error) {
+      return sendPaymentRouteError(res, error);
+    }
+  }
+);
+
+app.post(
+  "/api/draft-pass/verify-payment",
+  paymentLimiter,
+  async (req, res) => {
+    try {
+      ensureRazorpayConfigured();
+
+      const user = await authenticateRequestUser(req);
+      const body = req.body || {};
+
+      const providerOrderId = cleanText(
+        body.razorpay_order_id,
+        120
+      );
+
+      const providerPaymentId = cleanText(
+        body.razorpay_payment_id,
+        120
+      );
+
+      const suppliedSignature = cleanText(
+        body.razorpay_signature,
+        200
+      );
+
+      if (
+        !providerOrderId.startsWith("order_") ||
+        !providerPaymentId.startsWith("pay_") ||
+        !/^[a-f0-9]{64}$/i.test(suppliedSignature)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "The payment verification details are incomplete or invalid.",
+          code: "PAYMENT_DETAILS_INVALID",
+          version: VERSION
+        });
+      }
+
+      const localOrder = await findDraftPassOrder({
+        userId: user.id,
+        providerOrderId
+      });
+
+      if (!localOrder) {
+        return res.status(404).json({
+          success: false,
+          error:
+            "The Draft Pass order was not found for this account.",
+          code: "DRAFT_PASS_ORDER_NOT_FOUND",
+          version: VERSION
+        });
+      }
+
+      const signatureValid =
+        verifyRazorpayPaymentSignature({
+          providerOrderId:
+            localOrder.provider_order_id,
+          providerPaymentId,
+          signature: suppliedSignature
+        });
+
+      if (!signatureValid) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Payment signature verification failed. The Draft Pass was not issued.",
+          code: "PAYMENT_SIGNATURE_INVALID",
+          version: VERSION
+        });
+      }
+
+      const payment = await razorpayRequest(
+        `/payments/${encodeURIComponent(providerPaymentId)}`,
+        {
+          method: "GET"
+        }
+      );
+
+      if (
+        !payment ||
+        payment.id !== providerPaymentId ||
+        payment.order_id !==
+          localOrder.provider_order_id ||
+        Number(payment.amount) !==
+          Number(localOrder.amount_paise) ||
+        payment.currency !==
+          localOrder.currency
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "The verified payment does not match the Draft Pass order.",
+          code: "PAYMENT_ORDER_MISMATCH",
+          version: VERSION
+        });
+      }
+
+      if (payment.status !== "captured") {
+        return res.status(409).json({
+          success: false,
+          error:
+            "The payment has not been captured yet. Please wait briefly and verify again.",
+          code: "PAYMENT_NOT_CAPTURED",
+          paymentStatus: payment.status || null,
+          version: VERSION
+        });
+      }
+
+      const finalized = await finalizeDraftPassPayment({
+        orderId: localOrder.id,
+        userId: user.id,
+        providerOrderId:
+          localOrder.provider_order_id,
+        providerPaymentId
+      });
+
+      if (!finalized.success) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "The payment was verified, but the Draft Pass could not be issued for this order.",
+          code:
+            finalized.order_status ||
+            "DRAFT_PASS_NOT_ISSUED",
+          version: VERSION
+        });
+      }
+
+      return res.status(200).json({
+        success: true,
+        message:
+          finalized.already_processed
+            ? "This payment was already verified. Your Draft Pass remains available."
+            : "Payment verified. One Draft Pass has been added to your account.",
+        alreadyProcessed:
+          Boolean(finalized.already_processed),
+        draftPass: {
+          remaining:
+            Number(finalized.remaining) || 0,
+          entitlementId:
+            finalized.entitlement_id || null
+        },
+        order: {
+          id: localOrder.id,
+          providerOrderId:
+            localOrder.provider_order_id,
+          providerPaymentId
+        },
+        version: VERSION
+      });
+    } catch (error) {
+      return sendPaymentRouteError(res, error);
+    }
+  }
+);
 
 app.get("/api/search", (req, res) => {
   res.status(200).json({
