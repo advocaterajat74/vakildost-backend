@@ -11,7 +11,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT) || 10000;
-const VERSION = "2026-07-31-phase-6-draft-generator-v1";
+const VERSION = "2026-08-04-phase-7-pro-subscriptions-v1";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const OPENAI_ROUTER_MODEL =
   process.env.OPENAI_ROUTER_MODEL || OPENAI_MODEL;
@@ -61,6 +61,30 @@ const DRAFT_PASS_PRODUCT_NAME =
 const RAZORPAY_API_BASE = "https://api.razorpay.com/v1";
 const RAZORPAY_TIMEOUT_MS = 15000;
 
+const PRO_PLAN_ID = String(
+  process.env.RAZORPAY_PRO_PLAN_ID ||
+  "plan_TLbsUn8bU6PjOp"
+).trim();
+
+const RAZORPAY_WEBHOOK_SECRET = String(
+  process.env.RAZORPAY_WEBHOOK_SECRET || ""
+).trim();
+
+const PRO_PRICE_PAISE = 29900;
+const PRO_CURRENCY = "INR";
+const PRO_AI_QUOTA_TOTAL = 50;
+const PRO_DRAFTS_TOTAL = 3;
+const PRO_TOTAL_BILLING_CYCLES = Math.max(
+  1,
+  Math.min(
+    1200,
+    Number.parseInt(
+      process.env.PRO_TOTAL_BILLING_CYCLES || "120",
+      10
+    ) || 120
+  )
+);
+
 const allowedOrigins = [
   "https://vakildost.in",
   "https://www.vakildost.in"
@@ -85,7 +109,16 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: "200kb" }));
+app.use(
+  express.json({
+    limit: "200kb",
+    verify(req, res, buffer) {
+      if (req.originalUrl === "/api/webhooks/razorpay") {
+        req.rawBody = Buffer.from(buffer);
+      }
+    }
+  })
+);
 
 const aiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -124,6 +157,20 @@ const draftLimiter = rateLimit({
     error:
       "Too many draft-generation requests. Please wait and try again.",
     code: "DRAFT_RATE_LIMIT",
+    version: VERSION
+  }
+});
+
+const proLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error:
+      "Too many Pro subscription requests. Please wait and try again.",
+    code: "PRO_RATE_LIMIT",
     version: VERSION
   }
 });
@@ -1917,6 +1964,591 @@ async function refundAIQuota(userId) {
 }
 
 
+
+function ensureProConfigured() {
+  ensureRazorpayConfigured();
+
+  if (!PRO_PLAN_ID.startsWith("plan_")) {
+    const error = new Error(
+      "VakilDost Pro plan configuration is incomplete."
+    );
+
+    error.code = "PRO_PLAN_NOT_CONFIGURED";
+    error.status = 503;
+    throw error;
+  }
+}
+
+function ensureWebhookConfigured() {
+  if (!RAZORPAY_WEBHOOK_SECRET) {
+    const error = new Error(
+      "Razorpay webhook secret is not configured."
+    );
+
+    error.code = "WEBHOOK_NOT_CONFIGURED";
+    error.status = 503;
+    throw error;
+  }
+}
+
+function supabaseAdminHeaders(extra = {}) {
+  ensureSupabaseConfigured();
+
+  return {
+    Accept: "application/json",
+    apikey: SUPABASE_SECRET_KEY,
+    Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    ...extra
+  };
+}
+
+function unixToIso(value) {
+  const seconds = Number(value);
+
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return null;
+  }
+
+  return new Date(seconds * 1000).toISOString();
+}
+
+function normalizeSubscriptionStatus(value) {
+  const status = cleanText(value, 40).toLowerCase();
+
+  const supported = new Set([
+    "pending",
+    "authenticated",
+    "active",
+    "paused",
+    "past_due",
+    "cancelled",
+    "expired",
+    "completed",
+    "halted"
+  ]);
+
+  if (supported.has(status)) {
+    return status;
+  }
+
+  if (status === "created") {
+    return "pending";
+  }
+
+  return "pending";
+}
+
+function isActiveProRecord(record) {
+  if (!record) {
+    return false;
+  }
+
+  if (!["active", "authenticated"].includes(record.status)) {
+    return false;
+  }
+
+  const end = Date.parse(record.current_period_end || "");
+
+  return Number.isFinite(end) && end > Date.now();
+}
+
+async function getUserSubscription(userId) {
+  const query = new URLSearchParams({
+    user_id: `eq.${userId}`,
+    plan: "eq.pro",
+    select:
+      "id,user_id,plan,status,price_paise,currency,ai_quota_total,ai_quota_used,drafts_total,drafts_used,current_period_start,current_period_end,cancel_at_period_end,cancelled_at,razorpay_plan_id,razorpay_subscription_id,razorpay_customer_id,last_payment_id,last_payment_status,created_at,updated_at",
+    limit: "1"
+  });
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/subscriptions?${query.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseAdminHeaders()
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase subscription lookup error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Pro subscription status could not be loaded."
+    );
+
+    error.code = "PRO_STATUS_FAILED";
+    error.status = 503;
+    throw error;
+  }
+
+  return Array.isArray(data) && data.length > 0
+    ? data[0]
+    : null;
+}
+
+async function getSubscriptionByProviderId(providerSubscriptionId) {
+  const query = new URLSearchParams({
+    razorpay_subscription_id:
+      `eq.${providerSubscriptionId}`,
+    select:
+      "id,user_id,plan,status,current_period_start,current_period_end,razorpay_subscription_id",
+    limit: "1"
+  });
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/subscriptions?${query.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseAdminHeaders()
+    }
+  );
+
+  if (!response.ok) {
+    const error = new Error(
+      "The Pro subscription record could not be located."
+    );
+
+    error.code = "PRO_LOOKUP_FAILED";
+    error.status = 503;
+    throw error;
+  }
+
+  return Array.isArray(data) && data.length > 0
+    ? data[0]
+    : null;
+}
+
+async function upsertUserSubscription(values) {
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/subscriptions?on_conflict=user_id,plan`,
+    {
+      method: "POST",
+      headers: supabaseAdminHeaders({
+        "Content-Type": "application/json",
+        Prefer:
+          "resolution=merge-duplicates,return=representation"
+      }),
+      body: JSON.stringify({
+        plan: "pro",
+        price_paise: PRO_PRICE_PAISE,
+        currency: PRO_CURRENCY,
+        ai_quota_total: PRO_AI_QUOTA_TOTAL,
+        drafts_total: PRO_DRAFTS_TOTAL,
+        ...values,
+        updated_at: new Date().toISOString()
+      })
+    }
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Supabase subscription upsert error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The Pro subscription record could not be updated."
+    );
+
+    error.code = "PRO_UPSERT_FAILED";
+    error.status = 503;
+    throw error;
+  }
+
+  return Array.isArray(data) ? data[0] : data;
+}
+
+async function claimWebhookEvent(eventId, eventType) {
+  if (!eventId) {
+    return true;
+  }
+
+  const { response, data } = await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/razorpay_webhook_events`,
+    {
+      method: "POST",
+      headers: supabaseAdminHeaders({
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+      }),
+      body: JSON.stringify({
+        event_id: eventId,
+        event_type: eventType,
+        status: "processing"
+      })
+    }
+  );
+
+  if (response.status === 409) {
+    return false;
+  }
+
+  if (!response.ok) {
+    console.error(
+      "Webhook event claim error:",
+      response.status,
+      data
+    );
+
+    const error = new Error(
+      "The webhook event could not be recorded."
+    );
+
+    error.code = "WEBHOOK_EVENT_CLAIM_FAILED";
+    error.status = 503;
+    throw error;
+  }
+
+  return true;
+}
+
+async function finishWebhookEvent(eventId, status, errorMessage = null) {
+  if (!eventId) {
+    return;
+  }
+
+  const query = new URLSearchParams({
+    event_id: `eq.${eventId}`
+  });
+
+  await fetchJsonWithTimeout(
+    `${SUPABASE_URL}/rest/v1/razorpay_webhook_events?${query.toString()}`,
+    {
+      method: "PATCH",
+      headers: supabaseAdminHeaders({
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+      }),
+      body: JSON.stringify({
+        status,
+        error_message: errorMessage,
+        processed_at: new Date().toISOString()
+      })
+    }
+  );
+}
+
+function verifyRazorpayWebhookSignature(rawBody, signature) {
+  if (!Buffer.isBuffer(rawBody)) {
+    return false;
+  }
+
+  const supplied = Buffer.from(
+    String(signature || ""),
+    "utf8"
+  );
+
+  const expectedHex = crypto
+    .createHmac("sha256", RAZORPAY_WEBHOOK_SECRET)
+    .update(rawBody)
+    .digest("hex");
+
+  const expected = Buffer.from(expectedHex, "utf8");
+
+  return (
+    supplied.length === expected.length &&
+    crypto.timingSafeEqual(supplied, expected)
+  );
+}
+
+function verifyRazorpaySubscriptionSignature({
+  paymentId,
+  subscriptionId,
+  signature
+}) {
+  const expectedHex = crypto
+    .createHmac("sha256", RAZORPAY_KEY_SECRET)
+    .update(`${paymentId}|${subscriptionId}`, "utf8")
+    .digest("hex");
+
+  const supplied = Buffer.from(
+    String(signature || ""),
+    "utf8"
+  );
+
+  const expected = Buffer.from(expectedHex, "utf8");
+
+  return (
+    supplied.length === expected.length &&
+    crypto.timingSafeEqual(supplied, expected)
+  );
+}
+
+async function consumeProAIQuota(userId) {
+  const result = await callSupabaseRpc(
+    "consume_pro_ai_quota",
+    {
+      p_user_id: userId
+    }
+  );
+
+  if (!result || typeof result.allowed !== "boolean") {
+    const error = new Error(
+      "The Pro quota service returned an invalid response."
+    );
+
+    error.code = "PRO_QUOTA_INVALID";
+    error.status = 503;
+    throw error;
+  }
+
+  return result;
+}
+
+async function refundProAIQuota(userId) {
+  try {
+    await callSupabaseRpc(
+      "refund_pro_ai_quota",
+      {
+        p_user_id: userId
+      }
+    );
+  } catch (error) {
+    console.error("Pro quota refund failed:", error);
+  }
+}
+
+async function consumeUnifiedAIQuota(userId) {
+  const pro = await consumeProAIQuota(userId);
+
+  if (pro.is_pro) {
+    return {
+      source: "pro",
+      allowed: Boolean(pro.allowed),
+      used: Number(pro.used) || 0,
+      remaining: Number(pro.remaining) || 0,
+      limit: Number(pro.total) || PRO_AI_QUOTA_TOTAL,
+      periodEnd: pro.period_end || null
+    };
+  }
+
+  const free = await consumeAIQuota(userId);
+
+  return {
+    source: "free",
+    allowed: Boolean(free.allowed),
+    used: Number(free.used) || 0,
+    remaining: Number(free.remaining) || 0,
+    limit: DAILY_AI_LIMIT,
+    quotaDate: free.quota_date || null
+  };
+}
+
+async function refundUnifiedAIQuota(userId, reservation) {
+  if (!reservation || !userId) {
+    return;
+  }
+
+  if (reservation.source === "pro") {
+    await refundProAIQuota(userId);
+    return;
+  }
+
+  await refundAIQuota(userId);
+}
+
+async function ensureProDraftEntitlement(userId) {
+  const result = await callSupabaseRpc(
+    "ensure_pro_draft_entitlement",
+    {
+      p_user_id: userId
+    }
+  );
+
+  return result || {
+    granted: false,
+    remaining: 0
+  };
+}
+
+function formatProSubscription(record) {
+  if (!record) {
+    return {
+      plan: "free",
+      status: "inactive",
+      active: false,
+      pricePaise: PRO_PRICE_PAISE,
+      currency: PRO_CURRENCY,
+      ai: {
+        total: 0,
+        used: 0,
+        remaining: 0
+      },
+      drafts: {
+        total: 0,
+        used: 0,
+        remaining: 0
+      },
+      currentPeriodStart: null,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false
+    };
+  }
+
+  return {
+    plan: record.plan,
+    status: record.status,
+    active: isActiveProRecord(record),
+    pricePaise: Number(record.price_paise) || PRO_PRICE_PAISE,
+    currency: record.currency || PRO_CURRENCY,
+    ai: {
+      total: Number(record.ai_quota_total) || 0,
+      used: Number(record.ai_quota_used) || 0,
+      remaining: Math.max(
+        0,
+        (Number(record.ai_quota_total) || 0) -
+        (Number(record.ai_quota_used) || 0)
+      )
+    },
+    drafts: {
+      total: Number(record.drafts_total) || 0,
+      used: Number(record.drafts_used) || 0,
+      remaining: Math.max(
+        0,
+        (Number(record.drafts_total) || 0) -
+        (Number(record.drafts_used) || 0)
+      )
+    },
+    currentPeriodStart: record.current_period_start || null,
+    currentPeriodEnd: record.current_period_end || null,
+    cancelAtPeriodEnd: Boolean(record.cancel_at_period_end),
+    providerSubscriptionId:
+      record.razorpay_subscription_id || null
+  };
+}
+
+async function applyRazorpaySubscriptionEvent(eventType, payload) {
+  const subscription =
+    payload?.subscription?.entity || null;
+
+  const payment =
+    payload?.payment?.entity || null;
+
+  if (!subscription?.id) {
+    return;
+  }
+
+  const providerSubscriptionId = cleanText(
+    subscription.id,
+    120
+  );
+
+  const existing =
+    await getSubscriptionByProviderId(
+      providerSubscriptionId
+    );
+
+  const notes = subscription.notes || {};
+  const userId =
+    existing?.user_id ||
+    cleanText(notes.vakildost_user_id, 80);
+
+  if (!isUuid(userId)) {
+    console.warn(
+      "Ignoring subscription webhook without a valid VakilDost user id:",
+      providerSubscriptionId,
+      eventType
+    );
+    return;
+  }
+
+  const status =
+    eventType === "subscription.charged"
+      ? "active"
+      : normalizeSubscriptionStatus(
+          subscription.status
+        );
+
+  const previousStart =
+    existing?.current_period_start || null;
+  const incomingStart =
+    unixToIso(
+      subscription.current_start ||
+      subscription.start_at
+    );
+
+  const isNewBillingPeriod =
+    Boolean(incomingStart) &&
+    incomingStart !== previousStart &&
+    (
+      eventType === "subscription.activated" ||
+      eventType === "subscription.charged"
+    );
+
+  const values = {
+    user_id: userId,
+    status,
+    razorpay_plan_id:
+      subscription.plan_id || PRO_PLAN_ID,
+    razorpay_subscription_id:
+      providerSubscriptionId,
+    razorpay_customer_id:
+      subscription.customer_id || null,
+    current_period_start:
+      incomingStart || previousStart,
+    current_period_end:
+      unixToIso(
+        subscription.current_end ||
+        subscription.end_at ||
+        subscription.expire_by
+      ) || existing?.current_period_end || null,
+    cancel_at_period_end:
+      Boolean(
+        subscription.has_scheduled_changes &&
+        ["cancelled", "completed"].includes(status)
+      ),
+    cancelled_at:
+      status === "cancelled"
+        ? new Date().toISOString()
+        : existing?.cancelled_at || null,
+    last_payment_id:
+      payment?.id || existing?.last_payment_id || null,
+    last_payment_status:
+      payment?.status ||
+      existing?.last_payment_status ||
+      null
+  };
+
+  if (isNewBillingPeriod) {
+    values.ai_quota_used = 0;
+    values.drafts_used = 0;
+  }
+
+  await upsertUserSubscription(values);
+
+  if (
+    ["active", "authenticated"].includes(status)
+  ) {
+    await ensureProDraftEntitlement(userId);
+  }
+}
+
+function sendProRouteError(res, error) {
+  console.error("VakilDost Pro error:", error);
+
+  const status =
+    Number(error?.status) ||
+    (error?.name === "AbortError" ? 504 : 500);
+
+  return res.status(status).json({
+    success: false,
+    error:
+      error?.message ||
+      "The VakilDost Pro request could not be completed.",
+    code:
+      error?.code ||
+      (error?.name === "AbortError"
+        ? "PRO_TIMEOUT"
+        : "PRO_ERROR"),
+    version: VERSION
+  });
+}
+
 function ensureRazorpayConfigured() {
   if (
     !RAZORPAY_KEY_ID ||
@@ -2681,7 +3313,8 @@ app.get("/", (req, res) => {
       "Mobile-friendly formatting",
       "Intelligence routing before quota",
       "Verified one-time Draft Pass payments",
-      "Secure AI Draft Generator"
+      "Secure AI Draft Generator",
+      "VakilDost Pro monthly subscriptions"
     ],
     version: VERSION
   });
@@ -2717,10 +3350,506 @@ app.get("/health", (req, res) => {
     draftModel: OPENAI_DRAFT_MODEL,
     intelligenceRouter: true,
     draftGenerator: true,
+    proSubscriptions: true,
+    proPlanConfigured:
+      Boolean(PRO_PLAN_ID && RAZORPAY_WEBHOOK_SECRET),
+    proPlanId: PRO_PLAN_ID,
+    proPricePaise: PRO_PRICE_PAISE,
+    proCurrency: PRO_CURRENCY,
     version: VERSION
   });
 });
 
+
+
+app.post(
+  "/api/webhooks/razorpay",
+  async (req, res) => {
+    let eventId = "";
+    let eventType = "";
+
+    try {
+      ensureWebhookConfigured();
+
+      const signature = String(
+        req.headers["x-razorpay-signature"] || ""
+      ).trim();
+
+      if (
+        !verifyRazorpayWebhookSignature(
+          req.rawBody,
+          signature
+        )
+      ) {
+        return res.status(400).json({
+          success: false,
+          error: "Invalid webhook signature.",
+          code: "WEBHOOK_SIGNATURE_INVALID",
+          version: VERSION
+        });
+      }
+
+      const event = req.body || {};
+      eventId = cleanText(
+        req.headers["x-razorpay-event-id"] ||
+        event.id ||
+        crypto
+          .createHash("sha256")
+          .update(req.rawBody)
+          .digest("hex"),
+        160
+      );
+      eventType = cleanText(event.event, 100);
+
+      const claimed = await claimWebhookEvent(
+        eventId,
+        eventType
+      );
+
+      if (!claimed) {
+        return res.status(200).json({
+          success: true,
+          duplicate: true,
+          version: VERSION
+        });
+      }
+
+      const supportedEvents = new Set([
+        "subscription.authenticated",
+        "subscription.activated",
+        "subscription.charged",
+        "subscription.pending",
+        "subscription.halted",
+        "subscription.paused",
+        "subscription.resumed",
+        "subscription.updated",
+        "subscription.cancelled",
+        "subscription.completed"
+      ]);
+
+      if (supportedEvents.has(eventType)) {
+        await applyRazorpaySubscriptionEvent(
+          eventType,
+          event.payload || {}
+        );
+      }
+
+      await finishWebhookEvent(
+        eventId,
+        "processed"
+      );
+
+      return res.status(200).json({
+        success: true,
+        processed: supportedEvents.has(eventType),
+        event: eventType,
+        version: VERSION
+      });
+    } catch (error) {
+      await finishWebhookEvent(
+        eventId,
+        "failed",
+        cleanText(error?.message, 500)
+      ).catch(() => {});
+
+      console.error("Razorpay webhook error:", error);
+
+      return res.status(
+        Number(error?.status) || 500
+      ).json({
+        success: false,
+        error: "Webhook processing failed.",
+        code:
+          error?.code ||
+          "WEBHOOK_PROCESSING_FAILED",
+        version: VERSION
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/pro/status",
+  proLimiter,
+  async (req, res) => {
+    try {
+      const user = await authenticateRequestUser(req);
+      const subscription =
+        await getUserSubscription(user.id);
+
+      return res.status(200).json({
+        success: true,
+        pro: formatProSubscription(subscription),
+        plan: {
+          name: "VakilDost Pro",
+          pricePaise: PRO_PRICE_PAISE,
+          currency: PRO_CURRENCY,
+          aiGuidancePerMonth: PRO_AI_QUOTA_TOTAL,
+          draftsPerMonth: PRO_DRAFTS_TOTAL
+        },
+        user: {
+          id: user.id,
+          email: user.email || null
+        },
+        version: VERSION
+      });
+    } catch (error) {
+      return sendProRouteError(res, error);
+    }
+  }
+);
+
+app.post(
+  "/api/pro/create-subscription",
+  proLimiter,
+  async (req, res) => {
+    try {
+      ensureProConfigured();
+
+      const user = await authenticateRequestUser(req);
+      const existing =
+        await getUserSubscription(user.id);
+
+      if (isActiveProRecord(existing)) {
+        return res.status(409).json({
+          success: false,
+          error:
+            "VakilDost Pro is already active on this account.",
+          code: "PRO_ALREADY_ACTIVE",
+          pro: formatProSubscription(existing),
+          version: VERSION
+        });
+      }
+
+      if (
+        existing?.razorpay_subscription_id &&
+        ["pending", "authenticated"].includes(
+          existing.status
+        )
+      ) {
+        const provider = await razorpayRequest(
+          `/subscriptions/${encodeURIComponent(
+            existing.razorpay_subscription_id
+          )}`,
+          {
+            method: "GET"
+          }
+        );
+
+        return res.status(200).json({
+          success: true,
+          reused: true,
+          checkout: {
+            keyId: RAZORPAY_KEY_ID,
+            subscriptionId: provider.id,
+            name: "VakilDost",
+            description:
+              "VakilDost Pro — 50 AI guidance requests and 3 AI-generated drafts per month",
+            amount: PRO_PRICE_PAISE,
+            currency: PRO_CURRENCY,
+            prefill: {
+              email: user.email || ""
+            }
+          },
+          version: VERSION
+        });
+      }
+
+      const provider = await razorpayRequest(
+        "/subscriptions",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            plan_id: PRO_PLAN_ID,
+            total_count:
+              PRO_TOTAL_BILLING_CYCLES,
+            quantity: 1,
+            customer_notify: true,
+            notes: {
+              product: "vakildost_pro",
+              vakildost_user_id: user.id,
+              vakildost_email:
+                cleanText(user.email, 240)
+            }
+          })
+        }
+      );
+
+      if (
+        !provider?.id ||
+        !String(provider.id).startsWith("sub_")
+      ) {
+        const error = new Error(
+          "Razorpay returned an invalid subscription."
+        );
+
+        error.code = "PRO_SUBSCRIPTION_INVALID";
+        error.status = 502;
+        throw error;
+      }
+
+      await upsertUserSubscription({
+        user_id: user.id,
+        status: normalizeSubscriptionStatus(
+          provider.status
+        ),
+        razorpay_plan_id:
+          provider.plan_id || PRO_PLAN_ID,
+        razorpay_subscription_id:
+          provider.id,
+        razorpay_customer_id:
+          provider.customer_id || null,
+        current_period_start:
+          unixToIso(
+            provider.current_start ||
+            provider.start_at
+          ),
+        current_period_end:
+          unixToIso(
+            provider.current_end ||
+            provider.end_at ||
+            provider.expire_by
+          )
+      });
+
+      return res.status(201).json({
+        success: true,
+        checkout: {
+          keyId: RAZORPAY_KEY_ID,
+          subscriptionId: provider.id,
+          name: "VakilDost",
+          description:
+            "VakilDost Pro — 50 AI guidance requests and 3 AI-generated drafts per month",
+          amount: PRO_PRICE_PAISE,
+          currency: PRO_CURRENCY,
+          prefill: {
+            email: user.email || ""
+          }
+        },
+        version: VERSION
+      });
+    } catch (error) {
+      return sendProRouteError(res, error);
+    }
+  }
+);
+
+app.post(
+  "/api/pro/verify",
+  proLimiter,
+  async (req, res) => {
+    try {
+      ensureProConfigured();
+
+      const user = await authenticateRequestUser(req);
+      const body = req.body || {};
+
+      const paymentId = cleanText(
+        body.razorpay_payment_id,
+        120
+      );
+      const subscriptionId = cleanText(
+        body.razorpay_subscription_id,
+        120
+      );
+      const signature = cleanText(
+        body.razorpay_signature,
+        200
+      );
+
+      if (
+        !paymentId.startsWith("pay_") ||
+        !subscriptionId.startsWith("sub_") ||
+        !/^[a-f0-9]{64}$/i.test(signature)
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "The subscription verification details are incomplete.",
+          code: "PRO_VERIFICATION_INVALID",
+          version: VERSION
+        });
+      }
+
+      if (
+        !verifyRazorpaySubscriptionSignature({
+          paymentId,
+          subscriptionId,
+          signature
+        })
+      ) {
+        return res.status(400).json({
+          success: false,
+          error:
+            "Subscription signature verification failed.",
+          code:
+            "PRO_SIGNATURE_INVALID",
+          version: VERSION
+        });
+      }
+
+      const local =
+        await getUserSubscription(user.id);
+
+      if (
+        !local ||
+        local.razorpay_subscription_id !==
+          subscriptionId
+      ) {
+        return res.status(404).json({
+          success: false,
+          error:
+            "This subscription was not created for the signed-in account.",
+          code: "PRO_SUBSCRIPTION_NOT_FOUND",
+          version: VERSION
+        });
+      }
+
+      const provider = await razorpayRequest(
+        `/subscriptions/${encodeURIComponent(
+          subscriptionId
+        )}`,
+        {
+          method: "GET"
+        }
+      );
+
+      const status =
+        normalizeSubscriptionStatus(
+          provider.status
+        );
+
+      const updated = await upsertUserSubscription({
+        user_id: user.id,
+        status,
+        razorpay_plan_id:
+          provider.plan_id || PRO_PLAN_ID,
+        razorpay_subscription_id:
+          provider.id,
+        razorpay_customer_id:
+          provider.customer_id || null,
+        current_period_start:
+          unixToIso(
+            provider.current_start ||
+            provider.start_at
+          ),
+        current_period_end:
+          unixToIso(
+            provider.current_end ||
+            provider.end_at ||
+            provider.expire_by
+          ),
+        last_payment_id: paymentId,
+        last_payment_status: "verified"
+      });
+
+      if (
+        ["active", "authenticated"].includes(
+          status
+        )
+      ) {
+        await ensureProDraftEntitlement(user.id);
+      }
+
+      return res.status(200).json({
+        success: true,
+        message:
+          status === "active"
+            ? "VakilDost Pro is active."
+            : "Subscription verified. Razorpay is completing activation.",
+        pro: formatProSubscription(updated),
+        version: VERSION
+      });
+    } catch (error) {
+      return sendProRouteError(res, error);
+    }
+  }
+);
+
+app.post(
+  "/api/pro/cancel",
+  proLimiter,
+  async (req, res) => {
+    try {
+      ensureProConfigured();
+
+      const user = await authenticateRequestUser(req);
+      const subscription =
+        await getUserSubscription(user.id);
+
+      if (!subscription?.razorpay_subscription_id) {
+        return res.status(404).json({
+          success: false,
+          error:
+            "No VakilDost Pro subscription was found.",
+          code: "PRO_NOT_FOUND",
+          version: VERSION
+        });
+      }
+
+      if (
+        ["cancelled", "completed", "expired"].includes(
+          subscription.status
+        )
+      ) {
+        return res.status(200).json({
+          success: true,
+          alreadyCancelled: true,
+          pro: formatProSubscription(subscription),
+          version: VERSION
+        });
+      }
+
+      const cancelAtCycleEnd =
+        req.body?.cancelAtCycleEnd !== false;
+
+      const provider = await razorpayRequest(
+        `/subscriptions/${encodeURIComponent(
+          subscription.razorpay_subscription_id
+        )}/cancel`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            cancel_at_cycle_end:
+              cancelAtCycleEnd ? 1 : 0
+          })
+        }
+      );
+
+      const updated = await upsertUserSubscription({
+        user_id: user.id,
+        status: normalizeSubscriptionStatus(
+          provider.status
+        ),
+        razorpay_subscription_id:
+          provider.id,
+        cancel_at_period_end:
+          cancelAtCycleEnd,
+        cancelled_at:
+          cancelAtCycleEnd
+            ? null
+            : new Date().toISOString(),
+        current_period_start:
+          unixToIso(provider.current_start) ||
+          subscription.current_period_start,
+        current_period_end:
+          unixToIso(provider.current_end) ||
+          subscription.current_period_end
+      });
+
+      return res.status(200).json({
+        success: true,
+        message: cancelAtCycleEnd
+          ? "VakilDost Pro will remain available until the end of the current billing period."
+          : "VakilDost Pro has been cancelled.",
+        pro: formatProSubscription(updated),
+        version: VERSION
+      });
+    } catch (error) {
+      return sendProRouteError(res, error);
+    }
+  }
+);
 
 app.get(
   "/api/draft-pass/status",
@@ -3096,6 +4225,12 @@ app.post(
 
       await releaseStaleDraftReservations(user.id);
 
+      // Active Pro members receive up to three monthly draft credits.
+      // The SQL function grants those credits into the existing secure
+      // Draft Pass entitlement system, so the proven idempotent generator
+      // flow below remains unchanged.
+      await ensureProDraftEntitlement(user.id);
+
       const reservation =
         await reserveDraftPassForGeneration({
           userId: user.id,
@@ -3374,7 +4509,7 @@ app.post("/api/search", aiLimiter, async (req, res) => {
       authenticatedUser &&
       authenticatedUser.id
     ) {
-      await refundAIQuota(authenticatedUser.id);
+      await refundUnifiedAIQuota(authenticatedUser.id, quotaReservation);
       quotaReservation = null;
     }
   }
@@ -3517,19 +4652,28 @@ app.post("/api/search", aiLimiter, async (req, res) => {
     }
 
     quotaReservation =
-      await consumeAIQuota(authenticatedUser.id);
+      await consumeUnifiedAIQuota(authenticatedUser.id);
 
     if (!quotaReservation.allowed) {
+      const isPro =
+        quotaReservation.source === "pro";
+
       return res.status(429).json({
         success: false,
-        error:
-          `You have used all ${DAILY_AI_LIMIT} free AI questions for today. Your quota resets at midnight India time.`,
-        code: "DAILY_QUOTA_REACHED",
+        error: isPro
+          ? "You have used all 50 VakilDost Pro AI guidance requests for the current billing period."
+          : `You have used all ${DAILY_AI_LIMIT} free AI questions for today. Your quota resets at midnight India time.`,
+        code: isPro
+          ? "PRO_AI_QUOTA_REACHED"
+          : "DAILY_QUOTA_REACHED",
         quota: {
-          limit: DAILY_AI_LIMIT,
+          source: quotaReservation.source,
+          limit: quotaReservation.limit,
           used: quotaReservation.used,
           remaining: 0,
-          date: quotaReservation.quota_date || null
+          date: quotaReservation.quotaDate || null,
+          periodEnd:
+            quotaReservation.periodEnd || null
         },
         version: VERSION
       });
