@@ -11,7 +11,7 @@ app.disable("x-powered-by");
 app.set("trust proxy", 1);
 
 const PORT = Number(process.env.PORT) || 10000;
-const VERSION = "2026-08-04-phase-7-pro-subscriptions-v1";
+const VERSION = "2026-08-04-phase-7-pro-subscriptions-v2-cors-fixed";
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const OPENAI_ROUTER_MODEL =
   process.env.OPENAI_ROUTER_MODEL || OPENAI_MODEL;
@@ -85,29 +85,108 @@ const PRO_TOTAL_BILLING_CYCLES = Math.max(
   )
 );
 
-const allowedOrigins = [
-  "https://vakildost.in",
-  "https://www.vakildost.in"
-];
+// =========================================================
+// SECURE CORS CONFIGURATION
+// =========================================================
 
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin || allowedOrigins.includes(origin)) {
-        return callback(null, true);
-      }
+function isAllowedOrigin(origin) {
+  if (!origin) {
+    return true;
+  }
 
-      return callback(new Error("Origin not allowed"));
-    },
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Accept",
-      "Authorization",
-      "Idempotency-Key"
-    ]
-  })
-);
+  try {
+    const parsedOrigin = new URL(origin);
+    const hostname =
+      parsedOrigin.hostname.toLowerCase();
+    const protocol =
+      parsedOrigin.protocol.toLowerCase();
+
+    const isVakilDostDomain =
+      protocol === "https:" &&
+      (
+        hostname === "vakildost.in" ||
+        hostname.endsWith(".vakildost.in")
+      );
+
+    const isLocalDevelopment =
+      (
+        protocol === "http:" ||
+        protocol === "https:"
+      ) &&
+      (
+        hostname === "localhost" ||
+        hostname === "127.0.0.1"
+      );
+
+    return (
+      isVakilDostDomain ||
+      isLocalDevelopment
+    );
+  } catch (error) {
+    return false;
+  }
+}
+
+const corsOptions = {
+  origin(origin, callback) {
+    return callback(
+      null,
+      isAllowedOrigin(origin)
+    );
+  },
+  methods: [
+    "GET",
+    "POST",
+    "OPTIONS"
+  ],
+  allowedHeaders: [
+    "Content-Type",
+    "Accept",
+    "Authorization",
+    "Idempotency-Key",
+    "X-Razorpay-Signature",
+    "X-Razorpay-Event-Id"
+  ],
+  exposedHeaders: [
+    "RateLimit-Limit",
+    "RateLimit-Remaining",
+    "RateLimit-Reset",
+    "Retry-After"
+  ],
+  credentials: false,
+  maxAge: 86400,
+  optionsSuccessStatus: 204
+};
+
+// Reject unapproved browser origins cleanly before any API,
+// payment, AI, quota or subscription route is executed.
+app.use((req, res, next) => {
+  const origin = String(
+    req.headers.origin || ""
+  ).trim();
+
+  if (origin && !isAllowedOrigin(origin)) {
+    console.warn(
+      "Blocked CORS origin:",
+      origin,
+      req.method,
+      req.originalUrl
+    );
+
+    return res.status(403).json({
+      success: false,
+      error:
+        "This website is not permitted to use the VakilDost API.",
+      code: "ORIGIN_NOT_ALLOWED",
+      version: VERSION
+    });
+  }
+
+  return next();
+});
+
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 
 app.use(
   express.json({
@@ -4877,10 +4956,14 @@ HANDLING INSTRUCTIONS:
       router: routerDecision,
       quotaConsumed: true,
       quota: {
-        limit: DAILY_AI_LIMIT,
+        source: quotaReservation.source,
+        limit: quotaReservation.limit,
         used: quotaReservation.used,
         remaining: quotaReservation.remaining,
-        date: quotaReservation.quota_date || null
+        date:
+          quotaReservation.quotaDate || null,
+        periodEnd:
+          quotaReservation.periodEnd || null
       },
       user: {
         id: authenticatedUser.id,
@@ -4928,18 +5011,11 @@ HANDLING INSTRUCTIONS:
 });
 
 app.use((error, req, res, next) => {
-  console.error("Express error:", error);
-
-  if (error.message === "Origin not allowed") {
-    return res.status(403).json({
-      success: false,
-      error:
-        "This website is not permitted to use the API.",
-      version: VERSION
-    });
-  }
-
-  if (
+  console.error(
+    "Express error:",
+    error?.message || error
+  );
+if (
     error instanceof SyntaxError &&
     error.status === 400 &&
     "body" in error
